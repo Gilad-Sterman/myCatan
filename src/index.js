@@ -971,20 +971,321 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('end-turn', (setupPhase) => {
+  socket.on('end-turn', () => {
     const playerInfo = playerSockets.get(socket.id);
     if (!playerInfo) return;
 
     const game = games.get(playerInfo.gameId);
     if (!game || game.status !== 'playing') return;
 
-    // Broadcast turn ended to all players
+    // Clear any pending trades when turn ends
+    if (game.pendingTrades) {
+      game.pendingTrades.clear();
+      console.log(`Cleared pending trades for game ${playerInfo.gameId} on turn end`);
+    }
+
+    // Broadcast turn end to all players in the game
     io.to(playerInfo.gameId).emit('turn-ended', {
       playerName: playerInfo.playerName,
       timestamp: Date.now()
     });
 
-    console.log(`${playerInfo.playerName} ended their turn`);
+    console.log(`${playerInfo.playerName} ended their turn in game ${playerInfo.gameId}`);
+  });
+
+  // Player-to-player trading handlers
+  socket.on('propose-player-trade', (data) => {
+    const playerInfo = playerSockets.get(socket.id);
+    if (!playerInfo) return;
+
+    const game = games.get(playerInfo.gameId);
+    if (!game || game.status !== 'playing') return;
+
+    // Generate unique trade ID
+    const tradeId = `trade_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+    // Store trade offer in game state
+    if (!game.pendingTrades) {
+      game.pendingTrades = new Map();
+    }
+
+    const tradeOffer = {
+      id: tradeId,
+      fromPlayer: data.fromPlayer,
+      offering: data.offering,
+      requesting: data.requesting,
+      timestamp: Date.now(),
+      status: 'pending'
+    };
+
+    game.pendingTrades.set(tradeId, tradeOffer);
+
+    // Broadcast trade proposal to ALL players in the game (except the proposer)
+    const gamePlayers = Array.from(playerSockets.entries()).filter(
+      ([socketId, playerData]) => playerData.gameId === playerInfo.gameId && playerData.playerName !== playerInfo.playerName
+    );
+
+    gamePlayers.forEach(([socketId, playerData]) => {
+      console.log(`🔔 Emitting player-trade-proposed to ${playerData.playerName} (socket: ${socketId})`);
+      io.to(socketId).emit('player-trade-proposed', {
+        tradeId,
+        tradeOffer,
+        timestamp: Date.now()
+      });
+    });
+
+    console.log(`Trade proposed from ${data.fromPlayer.name} to all players:`, {
+      offering: data.offering,
+      requesting: data.requesting,
+      playersNotified: gamePlayers.map(([socketId, playerData]) => playerData.playerName)
+    });
+  });
+
+  socket.on('accept-player-trade', (data) => {
+    const { tradeId } = data;
+    const playerInfo = playerSockets.get(socket.id);
+    if (!playerInfo) return;
+
+    const game = games.get(playerInfo.gameId);
+    if (!game || game.status !== 'playing' || !game.pendingTrades) return;
+
+    const tradeOffer = game.pendingTrades.get(tradeId);
+    if (!tradeOffer || tradeOffer.status !== 'pending') {
+      socket.emit('action-error', {
+        action: 'accept-player-trade',
+        message: 'Trade offer not found or already processed'
+      });
+      return;
+    }
+
+    // Validate that the accepting player is not the proposer
+    if (tradeOffer.fromPlayer.name === playerInfo.playerName) {
+      socket.emit('action-error', {
+        action: 'accept-player-trade',
+        message: 'You cannot accept your own trade offer'
+      });
+      return;
+    }
+
+    // Add this player to the list of acceptances (don't execute trade yet)
+    if (!tradeOffer.acceptances) {
+      tradeOffer.acceptances = [];
+    }
+    
+    // Check if this player already responded
+    const existingResponse = tradeOffer.acceptances.find(a => a.playerName === playerInfo.playerName);
+    if (existingResponse) {
+      socket.emit('action-error', {
+        action: 'accept-player-trade',
+        message: 'You have already responded to this trade offer'
+      });
+      return;
+    }
+
+    // Add acceptance
+    tradeOffer.acceptances.push({
+      playerName: playerInfo.playerName,
+      response: 'accepted',
+      timestamp: Date.now()
+    });
+
+    // Notify the proposing player
+    const fromPlayerSocket = Array.from(playerSockets.entries()).find(
+      ([socketId, playerData]) => playerData.gameId === playerInfo.gameId && playerData.playerName === tradeOffer.fromPlayer.name
+    );
+
+    if (fromPlayerSocket) {
+      const [fromSocketId, fromPlayerData] = fromPlayerSocket;
+      io.to(fromSocketId).emit('player-trade-accepted', {
+        tradeId,
+        acceptedBy: playerInfo.playerName,
+        timestamp: Date.now()
+      });
+    }
+
+    console.log(`Trade accepted by ${playerInfo.playerName} for trade ${tradeId}`);
+  });
+
+  socket.on('reject-player-trade', (data) => {
+    const { tradeId } = data;
+    const playerInfo = playerSockets.get(socket.id);
+    if (!playerInfo) return;
+
+    const game = games.get(playerInfo.gameId);
+    if (!game || game.status !== 'playing' || !game.pendingTrades) return;
+
+    const tradeOffer = game.pendingTrades.get(tradeId);
+    if (!tradeOffer || tradeOffer.status !== 'pending') {
+      socket.emit('action-error', {
+        action: 'reject-player-trade',
+        message: 'Trade offer not found or already processed'
+      });
+      return;
+    }
+
+    // Validate that the rejecting player is not the proposer
+    if (tradeOffer.fromPlayer.name === playerInfo.playerName) {
+      socket.emit('action-error', {
+        action: 'reject-player-trade',
+        message: 'You cannot reject your own trade offer'
+      });
+      return;
+    }
+
+    // Add this player to the list of rejections
+    if (!tradeOffer.acceptances) {
+      tradeOffer.acceptances = [];
+    }
+    
+    // Check if this player already responded
+    const existingResponse = tradeOffer.acceptances.find(a => a.playerName === playerInfo.playerName);
+    if (existingResponse) {
+      socket.emit('action-error', {
+        action: 'reject-player-trade',
+        message: 'You have already responded to this trade offer'
+      });
+      return;
+    }
+
+    // Add rejection
+    tradeOffer.acceptances.push({
+      playerName: playerInfo.playerName,
+      response: 'rejected',
+      timestamp: Date.now()
+    });
+
+    // Find the proposing player's socket and notify them
+    const fromPlayerSocket = Array.from(playerSockets.entries()).find(
+      ([socketId, playerData]) => playerData.gameId === playerInfo.gameId && playerData.playerName === tradeOffer.fromPlayer.name
+    );
+
+    if (fromPlayerSocket) {
+      const [fromSocketId, fromPlayerData] = fromPlayerSocket;
+      io.to(fromSocketId).emit('player-trade-rejected', {
+        tradeId,
+        tradeOffer,
+        rejectedBy: playerInfo.playerName,
+        timestamp: Date.now()
+      });
+    }
+
+    console.log(`Trade rejected by ${playerInfo.playerName} for offer from ${tradeOffer.fromPlayer.name}`);
+
+    // Clean up rejected trade
+    game.pendingTrades.delete(tradeId);
+  });
+
+  // Handle final trade selection by proposer
+  socket.on('select-trade-partner', (data) => {
+    const { tradeId, selectedPlayerName } = data;
+    const playerInfo = playerSockets.get(socket.id);
+    if (!playerInfo) return;
+
+    const game = games.get(playerInfo.gameId);
+    if (!game || game.status !== 'playing' || !game.pendingTrades) return;
+
+    const tradeOffer = game.pendingTrades.get(tradeId);
+    if (!tradeOffer || tradeOffer.status !== 'pending') {
+      socket.emit('action-error', {
+        action: 'select-trade-partner',
+        message: 'Trade offer not found or already processed'
+      });
+      return;
+    }
+
+    // Validate that the selecting player is the proposer
+    if (tradeOffer.fromPlayer.name !== playerInfo.playerName) {
+      socket.emit('action-error', {
+        action: 'select-trade-partner',
+        message: 'You can only select partners for your own trade offers'
+      });
+      return;
+    }
+
+    // Check if the selected player actually accepted
+    const acceptance = tradeOffer.acceptances?.find(a => 
+      a.playerName === selectedPlayerName && a.response === 'accepted'
+    );
+    
+    if (!acceptance) {
+      socket.emit('action-error', {
+        action: 'select-trade-partner',
+        message: 'Selected player has not accepted this trade offer'
+      });
+      return;
+    }
+
+    // Execute the trade
+    const fromPlayer = game.gameState.players.find(p => p.name === tradeOffer.fromPlayer.name);
+    const toPlayer = game.gameState.players.find(p => p.name === selectedPlayerName);
+
+    if (!fromPlayer || !toPlayer) {
+      socket.emit('action-error', {
+        action: 'select-trade-partner',
+        message: 'Players not found in game state'
+      });
+      return;
+    }
+
+    // Validate resources
+    try {
+      // Check if fromPlayer has enough resources to offer
+      for (const [resource, amount] of Object.entries(tradeOffer.offering)) {
+        if (amount > 0 && fromPlayer.resources[resource] < amount) {
+          throw new Error(`${fromPlayer.name} doesn't have enough ${resource} to complete trade`);
+        }
+      }
+
+      // Check if toPlayer has enough resources to give
+      for (const [resource, amount] of Object.entries(tradeOffer.requesting)) {
+        if (amount > 0 && toPlayer.resources[resource] < amount) {
+          throw new Error(`${toPlayer.name} doesn't have enough ${resource} to complete trade`);
+        }
+      }
+
+      // Execute the trade
+      for (const [resource, amount] of Object.entries(tradeOffer.offering)) {
+        if (amount > 0) {
+          fromPlayer.resources[resource] -= amount;
+          toPlayer.resources[resource] += amount;
+        }
+      }
+
+      for (const [resource, amount] of Object.entries(tradeOffer.requesting)) {
+        if (amount > 0) {
+          toPlayer.resources[resource] -= amount;
+          fromPlayer.resources[resource] += amount;
+        }
+      }
+
+      // Mark trade as completed
+      tradeOffer.status = 'completed';
+      tradeOffer.selectedPartner = selectedPlayerName;
+
+      // Broadcast trade completion to all players in the game
+      io.to(playerInfo.gameId).emit('player-trade-completed', {
+        tradeId,
+        tradeOffer,
+        selectedPartner: selectedPlayerName,
+        playerResources: game.gameState.players,
+        timestamp: Date.now()
+      });
+
+      console.log(`Trade completed between ${fromPlayer.name} and ${toPlayer.name}:`, {
+        offering: tradeOffer.offering,
+        requesting: tradeOffer.requesting
+      });
+
+      // Clean up completed trade
+      game.pendingTrades.delete(tradeId);
+
+    } catch (error) {
+      console.error(`Error executing trade ${tradeId}:`, error.message);
+      socket.emit('action-error', {
+        action: 'select-trade-partner',
+        message: error.message
+      });
+    }
   });
 
   // Handle disconnect
